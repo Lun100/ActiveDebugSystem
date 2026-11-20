@@ -49,6 +49,16 @@ class InformationGainTests(unittest.TestCase):
         self.assertIs(select([cheap, split], state, .1), split)
         self.assertIs(select([cheap, split], state, 1), cheap)
 
+    def test_raising_one_probe_cost_changes_selection(self):
+        state = state_of(("a", .5), ("b", .5))
+        silent = Experiment(0, {"a": "2", "b": "2"}, 1)
+        discriminating = Experiment(1, {"a": "1", "b": "2"}, 1)
+        weight = .1
+        self.assertIs(select([silent, discriminating], state, weight), discriminating)
+
+        costly = Experiment(1, {"a": "1", "b": "2"}, 20)
+        self.assertIs(select([silent, costly], state, weight), silent)
+
     def test_select_rejects_empty_options(self):
         state = state_of(("a", .5), ("b", .5))
         with self.assertRaisesRegex(ValueError, "candidate"):
