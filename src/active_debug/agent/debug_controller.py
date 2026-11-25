@@ -1,6 +1,7 @@
 """Orchestrate B's pure diagnosis functions and A's budgeted tool executor."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict
 
 from active_debug.agent.agent import Actions
@@ -23,6 +24,7 @@ from active_debug.schemas import (
 )
 
 REPAIR_ACTION_RESERVE = 3  # repair + apply + public_verify
+DiagnosisCheckpointHook = Callable[[DiagnosisState, Experiment | None], None]
 
 
 def _resolve_chosen_option(chosen: Experiment, options: list[Experiment]) -> Experiment:
@@ -44,6 +46,8 @@ def diagnose(
     provider: Provider,
     *,
     initial_state: DiagnosisState | None = None,
+    pending_probe: Experiment | None = None,
+    on_checkpoint: DiagnosisCheckpointHook | None = None,
 ) -> DiagnosisState:
     if strategy not in (Strategy.LLM, Strategy.EIG):
         raise ValueError(f"diagnose requires hypothesis strategy, got {strategy!r}")
@@ -51,19 +55,30 @@ def diagnose(
     if initial_state is None:
         state = hypothesis_manager.initialize(hypothesis_generator.generate(trace))
         actions.logger.log("prior", state=asdict(state))
+        if on_checkpoint is not None:
+            on_checkpoint(state, None)
     else:
         state = initial_state
 
+    queued_probe = pending_probe
     while not stopping_policy.should_stop(state, config.confidence):
-        options = experiment_generator.generate(state)
-        required = 2 if strategy == Strategy.LLM else 1
-        if not options or actions.remaining < REPAIR_ACTION_RESERVE + required:
-            break
-        if strategy == Strategy.LLM:
-            raw_choice = actions.call("choose", provider.choose, state, options)
-            probe = _resolve_chosen_option(raw_choice, options)
+        if queued_probe is not None:
+            if actions.remaining < REPAIR_ACTION_RESERVE + 1:
+                break
+            probe = queued_probe
+            queued_probe = None
         else:
-            probe = experiment_selector.select(options, state, config.cost_weight)
+            options = experiment_generator.generate(state)
+            required = 2 if strategy == Strategy.LLM else 1
+            if not options or actions.remaining < REPAIR_ACTION_RESERVE + required:
+                break
+            if strategy == Strategy.LLM:
+                raw_choice = actions.call("choose", provider.choose, state, options)
+                probe = _resolve_chosen_option(raw_choice, options)
+                if on_checkpoint is not None:
+                    on_checkpoint(state, probe)
+            else:
+                probe = experiment_selector.select(options, state, config.cost_weight)
 
         obs = actions.call("probe", tools.run_experiment, probe)
         state = belief_updater.update(state, probe, obs)
@@ -73,4 +88,6 @@ def diagnose(
             observation=asdict(obs),
             beliefs=[asdict(h) for h in state.hypotheses],
         )
+        if on_checkpoint is not None:
+            on_checkpoint(state, None)
     return state

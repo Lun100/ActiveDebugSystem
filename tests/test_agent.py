@@ -9,7 +9,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from active_debug.agent.agent import Actions, BudgetExhausted, WallClockExhausted
-from active_debug.agent.baseline import run
+from active_debug.agent.baseline import make_runner, run
+from active_debug.agent.checkpoint import (
+    CheckpointMismatchError,
+    CheckpointStore,
+    InterruptPolicy,
+)
 from active_debug.agent.debug_controller import diagnose
 from active_debug.agent.llm_client import (
     MockProvider,
@@ -213,6 +218,115 @@ class ControllerAndBaselineTests(unittest.TestCase):
             )
             self.assertEqual(reason, "public_pass")
             self.assertEqual(actions.used, 4)
+
+
+class CheckpointAndResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.task = DebugTask(
+            "double",
+            'def solve(x: int) -> int:\n    """Return twice x."""\n    return x + 2\n',
+            Case(3, 6),
+        )
+
+    def test_interrupt_mid_run_charge_vs_rollback_and_resume(self):
+        class CrashingOnceRepairProvider(MockProvider):
+            def __init__(self):
+                super().__init__()
+                self.crashed = False
+
+            def repair(self, task, failure, state, feedback):
+                if not self.crashed:
+                    self.crashed = True
+                    raise RuntimeError("transient network drop during repair")
+                return super().repair(task, failure, state, feedback)
+
+        for policy, expected_final_actions in (
+            (InterruptPolicy.CHARGE_IN_FLIGHT, 6),
+            (InterruptPolicy.ROLLBACK_IN_FLIGHT, 5),
+        ):
+            with self.subTest(policy=policy), TemporaryDirectory() as tmp:
+                ckpt_path = Path(tmp) / "ckpt.json"
+                store = CheckpointStore(ckpt_path, interrupt_policy=policy)
+                provider = CrashingOnceRepairProvider()
+
+                # Run 1 crashes inside repair() after reproduce(1) + EIG probe(2) + repair(3)
+                actions1 = Actions(12, TraceLogger(Path(tmp) / "run1.jsonl"))
+                tools1 = ToolExecutor(self.task.source, self.task.public, 2.0)
+                with self.assertRaises(RuntimeError):
+                    run(
+                        self.task,
+                        Strategy.EIG,
+                        RunConfig(),
+                        actions1,
+                        tools1,
+                        provider,
+                        checkpoint_store=store,
+                    )
+
+                snap = store.load()
+                self.assertTrue(snap.interrupted)
+                self.assertEqual(snap.phase, "repairing")
+                self.assertEqual(snap.actions_used, 3)
+                self.assertEqual(snap.committed_actions_used, 2)
+                self.assertIsNotNone(snap.diagnosis_state)
+                self.assertEqual(snap.diagnosis_state.hypotheses[0].belief, 1.0)
+
+                # Run 2 resumes from checkpoint without repeating reproduce or EIG probe
+                actions2 = Actions(12, TraceLogger(Path(tmp) / "run2.jsonl"))
+                tools2 = ToolExecutor(self.task.source, self.task.public, 2.0)
+                runner = make_runner(checkpoint_store=store, resume=True)
+                reason = runner(self.task, Strategy.EIG, RunConfig(), actions2, tools2, provider)
+                self.assertEqual(reason, "public_pass")
+                self.assertEqual(actions2.used, expected_final_actions)
+                self.assertIn("return 2 * x", tools2.source)
+
+    def test_resume_after_budget_exhaustion_reuses_pending_patch(self):
+        with TemporaryDirectory() as tmp:
+            store = CheckpointStore(Path(tmp) / "budget_ckpt.json")
+            # 2 actions in DIRECT = reproduce(1) + repair(2) -> exhausts right before apply!
+            actions1 = Actions(2, TraceLogger(Path(tmp) / "part1.jsonl"))
+            tools1 = ToolExecutor(self.task.source, self.task.public, 2.0)
+            r1 = run(
+                self.task,
+                Strategy.DIRECT,
+                RunConfig(max_actions=2),
+                actions1,
+                tools1,
+                MockProvider(),
+                checkpoint_store=store,
+            )
+            self.assertEqual(r1, "budget_exhausted")
+            snap = store.load()
+            self.assertIsNotNone(snap.pending_patch)
+
+            # Resume with expanded budget (6): picks up pending_patch -> apply(3) -> public_verify(4)
+            actions2 = Actions(6, TraceLogger(Path(tmp) / "part2.jsonl"))
+            tools2 = ToolExecutor(self.task.source, self.task.public, 2.0)
+            r2 = run(
+                self.task,
+                Strategy.DIRECT,
+                RunConfig(max_actions=6),
+                actions2,
+                tools2,
+                MockProvider(),
+                checkpoint_store=store,
+                resume=True,
+            )
+            self.assertEqual(r2, "public_pass")
+            self.assertEqual(actions2.used, 4)
+
+            # Reject mismatched strategy on resume
+            with self.assertRaises(CheckpointMismatchError):
+                run(
+                    self.task,
+                    Strategy.EIG,
+                    RunConfig(max_actions=6),
+                    Actions(6, TraceLogger(Path(tmp) / "mismatch.jsonl")),
+                    ToolExecutor(self.task.source, self.task.public, 2.0),
+                    MockProvider(),
+                    checkpoint_store=store,
+                    resume=True,
+                )
 
 
 class ProviderTests(unittest.TestCase):
