@@ -9,6 +9,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from active_debug.agent.agent import Actions, BudgetExhausted, WallClockExhausted
+from active_debug.agent.baseline import run
+from active_debug.agent.debug_controller import diagnose
 from active_debug.agent.llm_client import (
     MockProvider,
     OpenAICompatibleProvider,
@@ -28,6 +30,8 @@ from active_debug.schemas import (
     Hypothesis,
     Observation,
     Patch,
+    RunConfig,
+    Strategy,
 )
 
 
@@ -127,6 +131,88 @@ class ActionsAndLoggerTests(unittest.TestCase):
             with self.assertRaises(WallClockExhausted):
                 actions.call("late", lambda: 42)
             self.assertEqual(actions.used, 0)
+
+
+class ControllerAndBaselineTests(unittest.TestCase):
+    def setUp(self):
+        self.task = DebugTask(
+            "double",
+            'def solve(x: int) -> int:\n    """Return twice x."""\n    return x + 2\n',
+            Case(3, 6),
+        )
+
+    def test_already_passing_stops_after_reproduce(self):
+        passing_task = DebugTask("ok", "def solve(x: int) -> int:\n    return 2 * x\n", Case(3, 6))
+        with TemporaryDirectory() as tmp:
+            logger = TraceLogger(Path(tmp) / "ok.jsonl")
+            actions = Actions(12, logger)
+            tools = ToolExecutor(passing_task.source, passing_task.public, 2.0)
+            reason = run(passing_task, Strategy.EIG, RunConfig(), actions, tools, MockProvider())
+            self.assertEqual(reason, "already_passing")
+            self.assertEqual(actions.used, 1)
+
+    def test_diagnose_rejects_unknown_provider_choice(self):
+        class BadChoiceProvider(MockProvider):
+            def choose(self, state, options):
+                return Experiment(999)
+
+        with TemporaryDirectory() as tmp:
+            logger = TraceLogger(Path(tmp) / "bad.jsonl")
+            actions = Actions(12, logger)
+            tools = ToolExecutor(self.task.source, self.task.public, 2.0)
+            failure = FailureTrace(Case(3, 6), Observation("5\n", "", 0))
+            with self.assertRaises(ValueError):
+                diagnose(failure, Strategy.LLM, RunConfig(), actions, tools, BadChoiceProvider())
+
+    def test_iterative_repair_recovers_from_invalid_and_wrong_patches(self):
+        seen_feedback: list[str] = []
+
+        class MultiTurnRepairProvider(MockProvider):
+            def __init__(self):
+                super().__init__()
+                self.turn = 0
+
+            def repair(self, task, failure, state, feedback):
+                seen_feedback.append(feedback)
+                self.turn += 1
+                if self.turn == 1:
+                    return Patch("def broken(:")  # syntax error -> apply fails
+                if self.turn == 2:
+                    return Patch("def solve(x):\n    return x + 1\n")  # wrong output -> verify fails
+                return Patch("def solve(x):\n    return 2 * x\n")
+
+        with TemporaryDirectory() as tmp:
+            logger = TraceLogger(Path(tmp) / "iter.jsonl")
+            actions = Actions(12, logger)
+            tools = ToolExecutor(self.task.source, self.task.public, 2.0)
+            reason = run(
+                self.task, Strategy.DIRECT, RunConfig(), actions, tools, MultiTurnRepairProvider()
+            )
+            self.assertEqual(reason, "public_pass")
+            self.assertEqual(seen_feedback[0], "")
+            self.assertIn("[apply_failed]", seen_feedback[1])
+            self.assertIn("[verify_failed]", seen_feedback[2])
+
+    def test_free_debug_reserves_budget_for_repair_when_tight(self):
+        class GreedyProbeProvider(MockProvider):
+            def free_probe(self, task, failure, feedback):
+                return Experiment(1)  # would probe forever if allowed
+
+        with TemporaryDirectory() as tmp:
+            logger = TraceLogger(Path(tmp) / "tight.jsonl")
+            # 4 actions = 1 reproduce + 3 (repair, apply, public_verify); no room for free_choice+probe
+            actions = Actions(4, logger)
+            tools = ToolExecutor(self.task.source, self.task.public, 2.0)
+            reason = run(
+                self.task,
+                Strategy.FREE,
+                RunConfig(max_actions=4),
+                actions,
+                tools,
+                GreedyProbeProvider(),
+            )
+            self.assertEqual(reason, "public_pass")
+            self.assertEqual(actions.used, 4)
 
 
 class ProviderTests(unittest.TestCase):
