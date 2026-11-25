@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import os
+from pathlib import Path
 import re
 import ssl
 import time
@@ -131,6 +132,39 @@ def _redact_secret(text: str, secret: str) -> str:
     if not secret:
         return text
     return text.replace(secret, "***")
+
+
+def load_dotenv(path: Path = Path(".env"), *, override: bool = False) -> dict[str, str]:
+    """Load KEY=VALUE pairs from a local .env file without external dependencies."""
+    if not path.is_file():
+        return {}
+    loaded: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, raw_val = line.split("=", 1)
+        key = key.strip()
+        if not key or not key.replace("_", "").isalnum():
+            continue
+        val = raw_val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            quote = val[0]
+            val = val[1:-1]
+            if quote == '"':
+                val = val.replace(r"\n", "\n").replace(r"\"", '"').replace(r"\\", "\\")
+        else:
+            # Strip trailing inline comment for unquoted values
+            if " #" in val:
+                val = val.split(" #", 1)[0].rstrip()
+        loaded[key] = val
+        if override or (val and key not in os.environ):
+            os.environ[key] = val
+    return loaded
 
 
 def _extract_json_object(raw: str) -> dict[str, Any]:
@@ -274,7 +308,10 @@ class OpenAICompatibleProvider:
         max_retries: int = 2,
         temperature: float = 0.0,
         max_tokens: int = 2048,
+        dotenv_path: Path | None = Path(".env"),
     ) -> OpenAICompatibleProvider:
+        if dotenv_path is not None:
+            load_dotenv(dotenv_path)
         api_key = os.environ.get("ACTIVE_DEBUG_API_KEY") or os.environ.get("OPENAI_API_KEY")
         resolved_url = (
             base_url

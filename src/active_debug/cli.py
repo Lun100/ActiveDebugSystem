@@ -11,7 +11,7 @@ import tomllib
 
 from active_debug.agent.baseline import make_runner, run
 from active_debug.agent.checkpoint import CheckpointStore, InterruptPolicy
-from active_debug.agent.llm_client import create_provider
+from active_debug.agent.llm_client import create_provider, load_dotenv
 from active_debug.evaluation.benchmark_runner import benchmark
 from active_debug.evaluation.dataset_loader import load
 from active_debug.schemas import RunConfig, Strategy
@@ -45,10 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for JSONL trace logs.",
     )
     parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(".env"),
+        help="Path to .env file loaded automatically if present.",
+    )
+    parser.add_argument(
         "--provider",
         choices=("mock", "openai", "openai-compatible", "http"),
-        default=os.environ.get("ACTIVE_DEBUG_PROVIDER", "mock"),
-        help="LLM provider backend (credentials read from environment variables).",
+        default=None,
+        help="LLM provider backend (defaults to ACTIVE_DEBUG_PROVIDER in .env/env or 'mock').",
     )
     parser.add_argument(
         "--model",
@@ -109,13 +115,16 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --resume requires --checkpoint <path>", file=sys.stderr)
         return 2
 
+    load_dotenv(args.env_file)
+    provider_kind = args.provider or os.environ.get("ACTIVE_DEBUG_PROVIDER") or "mock"
+
     config = RunConfig(**tomllib.loads(args.config.read_text(encoding="utf-8")))
     if args.max_actions is not None:
         config = replace(config, max_actions=args.max_actions)
 
     task, hidden = load(args.task)
     provider = create_provider(
-        args.provider,
+        provider_kind,
         model=args.model,
         base_url=args.base_url,
         timeout=args.provider_timeout,

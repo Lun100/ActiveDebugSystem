@@ -23,6 +23,7 @@ from active_debug.agent.llm_client import (
     ProviderError,
     ProviderResponseError,
     create_provider,
+    load_dotenv,
 )
 from active_debug.agent.tool_executor import ToolExecutor
 from active_debug.agent.trace_logger import TraceLogger
@@ -450,3 +451,28 @@ class ProviderTests(unittest.TestCase):
             self.assertIsInstance(client, OpenAICompatibleProvider)
             self.assertEqual(client.model, "deepseek-coder")
             self.assertEqual(client.base_url, "https://llm.example.org/v1")
+
+    def test_load_dotenv_parses_file_and_respects_existing_env(self):
+        with TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text(
+                '# comment\n'
+                'ACTIVE_DEBUG_API_KEY="sk-from-dotenv"\n'
+                "export ACTIVE_DEBUG_MODEL='qwen-max'\n"
+                "ACTIVE_DEBUG_BASE_URL=https://dashscope.example.com/v1 # inline comment\n",
+                encoding="utf-8",
+            )
+            cleaned = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("ACTIVE_DEBUG_") and not k.startswith("OPENAI_")
+            }
+            cleaned["ACTIVE_DEBUG_MODEL"] = "shell-override-model"
+            with patch.dict(os.environ, cleaned, clear=True):
+                parsed = load_dotenv(env_path)
+                self.assertEqual(parsed["ACTIVE_DEBUG_API_KEY"], "sk-from-dotenv")
+                client = create_provider("openai")
+                self.assertIsInstance(client, OpenAICompatibleProvider)
+                self.assertEqual(client.base_url, "https://dashscope.example.com/v1")
+                # Existing shell env var wins over .env when override=False
+                self.assertEqual(client.model, "shell-override-model")

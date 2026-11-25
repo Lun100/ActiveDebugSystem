@@ -18,6 +18,7 @@ from active_debug.agent.llm_client import (
     ProviderError,
     ProviderResponseError,
     create_provider,
+    load_dotenv,
 )
 from active_debug.agent.tool_executor import ToolExecutor
 from active_debug.agent.trace_logger import TraceLogger
@@ -43,6 +44,7 @@ __all__ = [
     "WallClockExhausted",
     "create_provider",
     "diagnose",
+    "load_dotenv",
     "make_runner",
     "run",
 ]
