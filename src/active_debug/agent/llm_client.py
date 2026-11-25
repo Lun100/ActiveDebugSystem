@@ -353,6 +353,8 @@ class OpenAICompatibleProvider:
                     detail = exc.read().decode("utf-8", errors="replace")[:300]
                 except Exception:
                     detail = str(exc)
+                finally:
+                    exc.close()
                 safe_detail = _redact_secret(detail, self._api_key)
                 last_error = ProviderError(f"HTTP {exc.code} from provider: {safe_detail}")
                 if exc.code not in _RETRYABLE_HTTP_CODES or attempt >= self.max_retries:

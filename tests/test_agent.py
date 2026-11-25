@@ -5,6 +5,10 @@ import unittest
 from unittest.mock import patch
 from urllib import error as urlerror
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from active_debug.agent.agent import Actions, BudgetExhausted, WallClockExhausted
 from active_debug.agent.llm_client import (
     MockProvider,
     OpenAICompatibleProvider,
@@ -14,6 +18,7 @@ from active_debug.agent.llm_client import (
     create_provider,
 )
 from active_debug.agent.tool_executor import ToolExecutor
+from active_debug.agent.trace_logger import TraceLogger
 from active_debug.schemas import (
     Case,
     DebugTask,
@@ -51,6 +56,77 @@ class ToolTests(unittest.TestCase):
         executor = ToolExecutor("def solve(x): return x", Case(1, 1), 2)
         self.assertFalse(executor.apply_patch(Patch("def ?")).applied)
         self.assertTrue(executor.verify_patch().passed)
+        # Missing solve() entry point is also rejected without overwriting source
+        missing_entry = executor.apply_patch(Patch("def helper(x):\n    return x * 2\n"))
+        self.assertFalse(missing_entry.applied)
+        self.assertIn("solve", missing_entry.detail)
+        self.assertTrue(executor.verify_patch().passed)
+
+    def test_output_truncation_cap(self):
+        noisy_src = "def solve(x):\n    print('A' * 500)\n    return x\n"
+        executor = ToolExecutor(noisy_src, Case(1, 1), 2, max_output_chars=128)
+        obs = executor.run_experiment(Experiment(1))
+        self.assertEqual(obs.returncode, 0)
+        self.assertIn("...[truncated]", obs.stdout)
+        self.assertLessEqual(len(obs.stdout), 150)
+
+
+class ActionsAndLoggerTests(unittest.TestCase):
+    def test_budget_telemetry_error_logging_and_redaction(self):
+        secret = "sk-log-secret-999"
+        with TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"OPENAI_API_KEY": secret}, clear=False
+        ):
+            log_path = Path(tmp) / "trace.jsonl"
+            logger = TraceLogger(log_path)
+            # Exclusive creation by default
+            with self.assertRaises(FileExistsError):
+                TraceLogger(log_path)
+            # Append mode works for resumed traces
+            resumed_logger = TraceLogger(log_path, allow_append=True)
+
+            provider = OpenAICompatibleProvider(
+                api_key=secret,
+                base_url="https://api.example.com/v1",
+                transport=lambda req, timeout: _chat_payload('{"action": "repair"}', 7, 3),
+            )
+            actions = Actions(2, resumed_logger)
+            task = DebugTask("t", "def solve(x): return x", Case(1, 1))
+            failure = FailureTrace(Case(1, 1), Observation("0", "", 0))
+
+            res = actions.call("free_choice", provider.free_probe, task, failure, secret)
+            self.assertIsNone(res)
+            self.assertEqual(actions.remaining, 1)
+            self.assertEqual(actions.total_tokens, 10)
+
+            # Failing call still deducts action budget before invocation and logs action_error
+            def boom():
+                raise RuntimeError(f"boom {secret}")
+
+            with self.assertRaises(RuntimeError):
+                actions.call("explode", boom)
+            self.assertEqual(actions.used, 2)
+
+            with self.assertRaises(BudgetExhausted):
+                actions.call("over_budget", lambda: 1)
+
+            raw_text = log_path.read_text(encoding="utf-8")
+            self.assertNotIn(secret, raw_text)
+            events = logger.read_events()
+            self.assertEqual([e["event"] for e in events], ["action", "response", "action", "action_error"])
+            self.assertEqual(events[1]["usage"]["total_tokens"], 10)
+            self.assertIn("duration_ms", events[1])
+
+    def test_wall_clock_deadline(self):
+        with TemporaryDirectory() as tmp:
+            logger = TraceLogger(Path(tmp) / "clock.jsonl")
+            actions = Actions(5, logger, wall_clock_limit=0.01)
+            import time
+
+            time.sleep(0.02)
+            with self.assertRaises(WallClockExhausted):
+                actions.call("late", lambda: 42)
+            self.assertEqual(actions.used, 0)
 
 
 class ProviderTests(unittest.TestCase):
