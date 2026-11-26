@@ -4,6 +4,9 @@ from active_debug.schemas import DiagnosisState, Experiment
 
 
 def information_gain(experiment: Experiment, state: DiagnosisState) -> float:
+    missing = [h.name for h in state.hypotheses if h.name not in experiment.predictions]
+    if missing:
+        raise ValueError("experiment lacks predictions for: " + ", ".join(missing))
     masses: dict[str, float] = {}
     for h in state.hypotheses:
         outcome = experiment.predictions[h.name]
@@ -12,4 +15,6 @@ def information_gain(experiment: Experiment, state: DiagnosisState) -> float:
 
 
 def select(options: list[Experiment], state: DiagnosisState, weight: float) -> Experiment:
+    if not options:
+        raise ValueError("no candidate experiments")
     return max(options, key=lambda e: information_gain(e, state) - weight * e.cost)
