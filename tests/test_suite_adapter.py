@@ -1,8 +1,12 @@
+import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
+from active_debug import cli
+from active_debug.agent.batch_runner import run_bundle_experiment
 from active_debug.agent.llm_client import OpenAICompatibleProvider
 from active_debug.agent.suite_executor import (
     SuiteToolExecutor,
@@ -11,6 +15,7 @@ from active_debug.agent.suite_executor import (
 )
 from active_debug.agent.suite_runner import (
     MockSuiteAdapter,
+    SuiteRepairProposal,
     normalize_predicted_function,
     run_suite_case,
 )
@@ -223,3 +228,129 @@ class SuiteRunnerFourStrategiesTests(unittest.TestCase):
         )
         self.assertEqual(normalize_predicted_function("`helper(x)`", symbols), "helper")
         self.assertIsNone(normalize_predicted_function("", symbols))
+
+
+class BatchDeliverablesAndCliTests(unittest.TestCase):
+    def test_batch_deliverables_plan_runs_candidates_and_resume(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = create_mini_bundle(root)
+            out_dir = root / "deliverables"
+
+            # 1. Run all 4 strategies via CLI --bundle (mock provider repairs demo/1!)
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
+                rc = cli.main(
+                    [
+                        "--bundle",
+                        str(bundle),
+                        "--output",
+                        str(out_dir),
+                        "--provider",
+                        "mock",
+                        "--experiment-id",
+                        "exp-v3-check",
+                        "--model-snapshot",
+                        "mock-v1",
+                        "--seeds",
+                        "0",
+                        "--sandbox",
+                        "local",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout_buf.getvalue())
+            self.assertEqual(summary["planned_runs"], 4)
+            self.assertEqual(summary["public_pass_runs"], 4)
+
+            # Verify plan.json contract
+            plan = json.loads((out_dir / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["experiment_id"], "exp-v3-check")
+            self.assertEqual(plan["model_snapshot"], "mock-v1")
+            self.assertEqual(plan["max_actions"], 12)
+            self.assertEqual(plan["seeds"], [0])
+
+            # Verify runs.jsonl & candidate directories containing buggy.py
+            rows = [
+                json.loads(line)
+                for line in (out_dir / "runs.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(rows), 4)
+            for row in rows:
+                self.assertEqual(row["experiment_id"], "exp-v3-check")
+                self.assertEqual(row["case_id"], "demo/1")
+                self.assertEqual(row["revision"], "abc123rev")
+                self.assertEqual(row["status"], "completed")
+                self.assertEqual(row["stop_reason"], "public_pass")
+                self.assertEqual(row["predicted_function"], "Adder.compute")
+                self.assertIsNotNone(row["candidate_dir"])
+                cand_buggy = out_dir / row["candidate_dir"] / "buggy.py"
+                self.assertTrue(cand_buggy.is_file())
+                self.assertIn("return a + b", cand_buggy.read_text(encoding="utf-8"))
+
+            # 2. Verify resume_batch skips already-completed runs
+            resumed = run_bundle_experiment(
+                bundle,
+                out_dir,
+                RunConfig(),
+                MockSuiteAdapter(),
+                seeds=(0,),
+                experiment_id="exp-v3-check",
+                sandbox="local",
+                resume_batch=True,
+                progress_stream=None,
+            )
+            self.assertEqual(resumed.executed_runs, 0)
+            self.assertEqual(resumed.skipped_completed_runs, 4)
+
+    def test_unmodified_candidate_is_null_and_partial_budget_candidate_is_retained(self):
+        class PartialWrongPatchAdapter(MockSuiteAdapter):
+            def repair(self, case, source, failure, diagnosis_summary, feedback, seed):
+                # Compiles & modifies source, but still fails public test -> hits budget_exhausted
+                return SuiteRepairProposal(
+                    Patch(source.replace("return a - b", "return a * b")),
+                    "Adder.compute",
+                )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = create_mini_bundle(root)
+
+            # Case A: max_actions=1 -> only reproduce runs, source unmodified -> candidate_dir is null
+            out_unmod = root / "out_unmodified"
+            run_bundle_experiment(
+                bundle,
+                out_unmod,
+                RunConfig(max_actions=1),
+                PartialWrongPatchAdapter(),
+                seeds=(0,),
+                strategies=(Strategy.DIRECT,),
+                sandbox="local",
+                progress_stream=None,
+            )
+            row_unmod = json.loads((out_unmod / "runs.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(row_unmod["status"], "completed")
+            self.assertEqual(row_unmod["stop_reason"], "budget_exhausted")
+            self.assertIsNone(row_unmod["candidate_dir"])
+
+            # Case B: max_actions=4 -> reproduce(1)+repair(2)+apply(3)+verify(4, fails) -> exhausts
+            # Source WAS modified, so candidate_dir MUST be retained with stop_reason="budget_exhausted"
+            out_mod = root / "out_modified"
+            run_bundle_experiment(
+                bundle,
+                out_mod,
+                RunConfig(max_actions=4),
+                PartialWrongPatchAdapter(),
+                seeds=(0,),
+                strategies=(Strategy.DIRECT,),
+                sandbox="local",
+                progress_stream=None,
+            )
+            row_mod = json.loads((out_mod / "runs.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(row_mod["status"], "completed")
+            self.assertEqual(row_mod["stop_reason"], "budget_exhausted")
+            self.assertIsNotNone(row_mod["candidate_dir"])
+            retained_file = out_mod / row_mod["candidate_dir"] / "buggy.py"
+            self.assertTrue(retained_file.is_file())
+            self.assertIn("return a * b", retained_file.read_text(encoding="utf-8"))
