@@ -1,12 +1,14 @@
 """Batch experiment orchestrator producing plan.json, runs.jsonl, and candidate directories."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import shutil
 import sys
+import threading
 from typing import Any, TextIO
 from uuid import uuid4
 
@@ -77,6 +79,11 @@ def _write_runs_atomic(runs_path: Path, rows: list[dict[str, Any]]) -> None:
     tmp_path.replace(runs_path)
 
 
+def _isolate_provider(provider: Any) -> Any:
+    clone_fn = getattr(provider, "clone", None)
+    return clone_fn() if callable(clone_fn) else provider
+
+
 def run_bundle_experiment(
     bundle_dir: Path,
     output_dir: Path,
@@ -92,6 +99,7 @@ def run_bundle_experiment(
     docker_image: str = "active-debug-pysnooper-1",
     wall_clock_limit: float | None = None,
     resume_batch: bool = False,
+    jobs: int = 1,
     progress_stream: TextIO | None = sys.stderr,
 ) -> BatchSummary:
     """Execute scheduled (seed, case, strategy) runs and emit C's 3 evaluation deliverables."""
@@ -99,6 +107,8 @@ def run_bundle_experiment(
         raise ValueError("at least one seed is required")
     if not strategies:
         raise ValueError("at least one strategy is required")
+    if jobs < 1:
+        raise ValueError("jobs must be at least 1")
 
     manifest: BundleManifest = load_bundle(bundle_dir)
     if case_ids:
@@ -158,7 +168,9 @@ def run_bundle_experiment(
     records_by_key = dict(existing_records)
     executed_count = 0
     skipped_count = 0
+    state_lock = threading.Lock()
 
+    pending_tasks: list[tuple[int, int, SuiteCase, Strategy]] = []
     for idx, (seed, case, strategy) in enumerate(ordered_keys, start=1):
         key = (seed, case.case_id, str(strategy))
         prev = records_by_key.get(key)
@@ -171,23 +183,28 @@ def run_bundle_experiment(
                 )
                 progress_stream.flush()
             continue
+        pending_tasks.append((idx, seed, case, strategy))
 
+    def _execute_one(item: tuple[int, int, SuiteCase, Strategy]) -> None:
+        nonlocal executed_count
+        idx, seed, case, strategy = item
+        key = (seed, case.case_id, str(strategy))
         slug = _run_slug(seed, case, strategy)
         trace_path = traces_root / f"{slug}.jsonl"
         logger = TraceLogger(trace_path, allow_append=resume_batch or trace_path.exists())
+        worker_provider = _isolate_provider(provider)
 
         outcome: SuiteRunOutcome = run_suite_case(
             case,
             strategy,
             config,
-            provider,
+            worker_provider,
             logger,
             seed=seed,
             sandbox=sandbox,
             docker_image=docker_image,
             wall_clock_limit=wall_clock_limit,
         )
-        executed_count += 1
 
         cand_dir = candidates_root / slug
         rel_candidate_dir: str | None = None
@@ -214,23 +231,33 @@ def run_bundle_experiment(
         if outcome.error_detail is not None:
             row["error_detail"] = outcome.error_detail
 
-        records_by_key[key] = row
-        # Persist runs.jsonl incrementally after every single run so progress is crash-safe
-        ordered_rows = [
-            records_by_key[(s, c.case_id, str(st))]
-            for s, c, st in ordered_keys
-            if (s, c.case_id, str(st)) in records_by_key
-        ]
-        _write_runs_atomic(runs_path, ordered_rows)
+        with state_lock:
+            executed_count += 1
+            records_by_key[key] = row
+            ordered_rows = [
+                records_by_key[(s, c.case_id, str(st))]
+                for s, c, st in ordered_keys
+                if (s, c.case_id, str(st)) in records_by_key
+            ]
+            _write_runs_atomic(runs_path, ordered_rows)
+            if progress_stream is not None:
+                progress_stream.write(
+                    f"[{skipped_count + executed_count}/{planned_total}] "
+                    f"(item #{idx}) seed={seed} case={case.case_id} "
+                    f"strategy={strategy} -> status={outcome.status} "
+                    f"stop={outcome.stop_reason} actions={outcome.actions} "
+                    f"({outcome.seconds:.2f}s)\n"
+                )
+                progress_stream.flush()
 
-        if progress_stream is not None:
-            progress_stream.write(
-                f"[{idx}/{planned_total}] seed={seed} case={case.case_id} "
-                f"strategy={strategy} -> status={outcome.status} "
-                f"stop={outcome.stop_reason} actions={outcome.actions} "
-                f"({outcome.seconds:.2f}s)\n"
-            )
-            progress_stream.flush()
+    if jobs == 1 or len(pending_tasks) <= 1:
+        for item in pending_tasks:
+            _execute_one(item)
+    else:
+        with ThreadPoolExecutor(max_workers=min(jobs, len(pending_tasks))) as pool:
+            futures = [pool.submit(_execute_one, item) for item in pending_tasks]
+            for fut in as_completed(futures):
+                fut.result()
 
     final_rows = [
         records_by_key[(s, c.case_id, str(st))]

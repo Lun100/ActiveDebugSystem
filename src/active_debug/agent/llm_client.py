@@ -337,6 +337,21 @@ class OpenAICompatibleProvider:
             max_retries=max_retries,
         )
 
+    def clone(self) -> OpenAICompatibleProvider:
+        """Create a thread-isolated provider instance with identical configuration."""
+        return OpenAICompatibleProvider(
+            api_key=self._api_key,
+            base_url=self.base_url,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            retry_backoff=self.retry_backoff,
+            transport=None if self._transport == self._default_transport else self._transport,
+            sleep_fn=self._sleep,
+        )
+
     def usage_summary(self) -> dict[str, int]:
         return {
             "total_calls": self.total_calls,

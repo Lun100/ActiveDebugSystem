@@ -120,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip already-completed (seed, case_id, strategy) entries in runs.jsonl.",
     )
     parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of concurrent isolated runs in --bundle mode.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("results"),
@@ -236,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
             docker_image=args.docker_image,
             wall_clock_limit=args.wall_clock_limit,
             resume_batch=args.resume_batch,
+            jobs=args.jobs,
         )
         print(json.dumps(asdict(summary), ensure_ascii=False))
         return 0 if summary.error_runs == 0 else 1
