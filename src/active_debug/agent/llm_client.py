@@ -47,6 +47,7 @@ class CallUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_tokens: int = 0
     retries: int = 0
     latency_ms: float = 0.0
 
@@ -55,6 +56,7 @@ class CallUsage:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
             "retries": self.retries,
             "latency_ms": round(self.latency_ms, 3),
         }
@@ -249,8 +251,8 @@ class OpenAICompatibleProvider:
         base_url: str = "https://api.openai.com/v1",
         model: str = "gpt-4o-mini",
         temperature: float = 0.0,
-        max_tokens: int = 2048,
-        timeout: float = 30.0,
+        max_tokens: int | None = None,
+        timeout: float = 90.0,
         max_retries: int = 2,
         retry_backoff: float = 0.5,
         transport: Transport | None = None,
@@ -304,10 +306,10 @@ class OpenAICompatibleProvider:
         *,
         model: str | None = None,
         base_url: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 90.0,
         max_retries: int = 2,
         temperature: float = 0.0,
-        max_tokens: int = 2048,
+        max_tokens: int | None = None,
         dotenv_path: Path | None = Path(".env"),
     ) -> OpenAICompatibleProvider:
         if dotenv_path is not None:
@@ -369,8 +371,9 @@ class OpenAICompatibleProvider:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
         }
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
         if seed is not None:
             payload["seed"] = seed
         headers = {
@@ -423,11 +426,18 @@ class OpenAICompatibleProvider:
         prompt_tokens = int(usage_raw.get("prompt_tokens") or 0)
         completion_tokens = int(usage_raw.get("completion_tokens") or 0)
         total_tokens = int(usage_raw.get("total_tokens") or (prompt_tokens + completion_tokens))
+        comp_details = (
+            usage_raw.get("completion_tokens_details")
+            if isinstance(usage_raw.get("completion_tokens_details"), dict)
+            else {}
+        )
+        reasoning_tokens = int(comp_details.get("reasoning_tokens") or 0)
 
         self.last_usage = CallUsage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            reasoning_tokens=reasoning_tokens,
             retries=attempt,
             latency_ms=elapsed_ms,
         )

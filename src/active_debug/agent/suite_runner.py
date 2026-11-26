@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from math import isfinite
+import re
 from time import monotonic
 from typing import Any, Protocol
 
@@ -226,6 +227,35 @@ class OpenAISuiteAdapter:
         self.last_usage = self.client.last_usage
         return out
 
+    def _call_json_chat(
+        self, system_prompt: str, user_prompt: str, seed: int
+    ) -> dict[str, Any]:
+        raw = self._call_chat(system_prompt, user_prompt, seed)
+        try:
+            return _extract_json_object(raw)
+        except ProviderResponseError:
+            # One format-correction retry if model emitted malformed JSON
+            u1 = self.last_usage
+            retry_prompt = (
+                f"{user_prompt}\n\n"
+                "IMPORTANT: Your previous response could not be parsed as valid JSON. "
+                "Output ONLY a valid JSON object with properly escaped strings and no extra text."
+            )
+            raw2 = self.client.chat(system_prompt, retry_prompt, seed=seed)
+            u2 = self.client.last_usage
+            if u1 is not None and u2 is not None:
+                self.last_usage = CallUsage(
+                    prompt_tokens=u1.prompt_tokens + u2.prompt_tokens,
+                    completion_tokens=u1.completion_tokens + u2.completion_tokens,
+                    total_tokens=u1.total_tokens + u2.total_tokens,
+                    reasoning_tokens=u1.reasoning_tokens + u2.reasoning_tokens,
+                    retries=u1.retries + u2.retries + 1,
+                    latency_ms=u1.latency_ms + u2.latency_ms,
+                )
+            else:
+                self.last_usage = u2
+            return _extract_json_object(raw2)
+
     def hypothesize(
         self,
         case: SuiteCase,
@@ -262,8 +292,8 @@ class OpenAISuiteAdapter:
             f"Public test (test_public.py):\n```python\n{case.public_test_source}\n```\n\n"
             f"Initial public test failure:\n{_format_obs(failure)}"
         )
-        raw = self._call_chat(system_prompt, user_prompt, seed)
-        obj = _extract_json_object(raw)
+        raw = self._call_json_chat(system_prompt, user_prompt, seed)
+        obj = raw
 
         raw_hyps = obj.get("hypotheses")
         if not isinstance(raw_hyps, list) or not raw_hyps:
@@ -348,8 +378,8 @@ class OpenAISuiteAdapter:
             f"{_format_suite_diagnosis_summary(state, plan, probe_codes)}\n\n"
             f"Candidate probes:\n" + "\n".join(opt_lines)
         )
-        raw = self._call_chat(system_prompt, user_prompt, seed)
-        obj = _extract_json_object(raw)
+        raw = self._call_json_chat(system_prompt, user_prompt, seed)
+        obj = raw
         chosen_id = obj.get("probe_id", obj.get("argument"))
         if type(chosen_id) is int:
             for opt in options:
@@ -387,8 +417,8 @@ class OpenAISuiteAdapter:
             f"Public test failure:\n{_format_obs(failure)}\n\n"
             f"Previous probe/verify feedback:\n{feedback or '(none)'}"
         )
-        raw = self._call_chat(system_prompt, user_prompt, seed)
-        obj = _extract_json_object(raw)
+        raw = self._call_json_chat(system_prompt, user_prompt, seed)
+        obj = raw
         action = str(obj.get("action", "")).strip().lower()
         pred_fn = normalize_predicted_function(
             str(obj["predicted_function"]) if obj.get("predicted_function") is not None else None,
@@ -417,13 +447,10 @@ class OpenAISuiteAdapter:
             "You are an expert Python program repair agent. "
             "Fix the bug in buggy.py so both the public test and general edge cases pass, "
             "without overfitting to literal test inputs and while preserving all public APIs.\n"
-            "Respond ONLY with a JSON object:\n"
-            "{\n"
-            '  "predicted_function": "Class.method_or_func",\n'
-            '  "source": "<complete replacement Python source for buggy.py>"\n'
-            "}\n"
-            "(If escaping code in JSON is inconvenient, you may instead output a single "
-            "```python ... ``` block containing the full replacement file.)"
+            "Output format:\n"
+            "First line: PREDICTED_FUNCTION: <Class.method_or_func>\n"
+            "Followed by a single ```python ... ``` code block containing the complete "
+            "replacement buggy.py."
         )
         sections = [
             f"Case ID: {case.case_id} ({case.topic})",
@@ -439,14 +466,20 @@ class OpenAISuiteAdapter:
 
         raw = self._call_chat(system_prompt, "\n\n".join(sections), seed)
         pred_fn: str | None = None
-        try:
-            obj = _extract_json_object(raw)
-            if obj.get("predicted_function") is not None:
-                pred_fn = normalize_predicted_function(
-                    str(obj["predicted_function"]), case.callable_symbols
-                )
-        except ProviderResponseError:
-            pass
+        header_match = re.search(r"PREDICTED_FUNCTION\s*:\s*([^\r\n]+)", raw)
+        if header_match:
+            pred_fn = normalize_predicted_function(
+                header_match.group(1), case.callable_symbols
+            )
+        else:
+            try:
+                obj = _extract_json_object(raw)
+                if obj.get("predicted_function") is not None:
+                    pred_fn = normalize_predicted_function(
+                        str(obj["predicted_function"]), case.callable_symbols
+                    )
+            except ProviderResponseError:
+                pass
         extracted = _extract_python_source(raw)
         try:
             patch = Patch(extracted)
