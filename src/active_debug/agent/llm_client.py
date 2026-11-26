@@ -356,9 +356,13 @@ class OpenAICompatibleProvider:
             raise ProviderResponseError("provider HTTP response root must be a JSON object")
         return data
 
-    def _chat(self, system_prompt: str, user_prompt: str) -> str:
+    def chat(self, system_prompt: str, user_prompt: str, *, seed: int | None = None) -> str:
+        """Execute a single chat completion call with retry and token accounting."""
+        return self._chat(system_prompt, user_prompt, seed=seed)
+
+    def _chat(self, system_prompt: str, user_prompt: str, *, seed: int | None = None) -> str:
         endpoint = f"{self.base_url}/chat/completions"
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -367,7 +371,8 @@ class OpenAICompatibleProvider:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
-        body = json.dumps(payload).encode("utf-8")
+        if seed is not None:
+            payload["seed"] = seed
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -380,6 +385,7 @@ class OpenAICompatibleProvider:
         last_error: Exception | None = None
 
         while attempt <= self.max_retries:
+            body = json.dumps(payload).encode("utf-8")
             req = urlrequest.Request(endpoint, data=body, headers=headers, method="POST")
             try:
                 response = self._transport(req, self.timeout)
@@ -392,6 +398,10 @@ class OpenAICompatibleProvider:
                     detail = str(exc)
                 finally:
                     exc.close()
+                # Gracefully drop optional 'seed' parameter if an endpoint rejects it with 400
+                if exc.code == 400 and "seed" in payload and "seed" in detail.lower():
+                    payload.pop("seed", None)
+                    continue
                 safe_detail = _redact_secret(detail, self._api_key)
                 last_error = ProviderError(f"HTTP {exc.code} from provider: {safe_detail}")
                 if exc.code not in _RETRYABLE_HTTP_CODES or attempt >= self.max_retries:
