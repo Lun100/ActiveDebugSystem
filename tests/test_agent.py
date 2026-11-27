@@ -27,6 +27,7 @@ from active_debug.agent.llm_client import (
 )
 from active_debug.agent.tool_executor import ToolExecutor
 from active_debug.agent.trace_logger import TraceLogger
+from active_debug.diagnosis.belief_updater import UNEXPLAINED_CAUSE
 from active_debug.schemas import (
     Case,
     DebugTask,
@@ -169,6 +170,61 @@ class ControllerAndBaselineTests(unittest.TestCase):
             failure = FailureTrace(Case(3, 6), Observation("5\n", "", 0))
             with self.assertRaises(ValueError):
                 diagnose(failure, Strategy.LLM, RunConfig(), actions, tools, BadChoiceProvider())
+
+    def test_diagnose_stops_when_no_probe_can_reduce_entropy(self):
+        with TemporaryDirectory() as tmp:
+            logger = TraceLogger(Path(tmp) / "useless.jsonl")
+            actions = Actions(12, logger)
+            tools = ToolExecutor(self.task.source, self.task.public, 2.0)
+            history = [
+                (Experiment(1, {"adds_two": "3", "double_minus_one": "1"}),
+                 Observation("3", "", 0)),
+                (Experiment(2, {"adds_two": "4", "double_minus_one": "3"}),
+                 Observation("4", "", 0)),
+            ]
+            state = DiagnosisState(
+                [Hypothesis("adds_two", .5), Hypothesis("double_minus_one", .5)],
+                history,
+            )
+            failure = FailureTrace(Case(3, 6), Observation("5\n", "", 0))
+            for strategy in (Strategy.EIG, Strategy.LLM):
+                with self.subTest(strategy=strategy):
+                    result = diagnose(
+                        failure, strategy, RunConfig(), actions, tools, MockProvider(),
+                        initial_state=state,
+                    )
+                    # Only x=3 is left and both hypotheses predict "5": zero
+                    # bits, so neither choose nor probe spends an action.
+                    self.assertEqual(actions.used, 0)
+                    self.assertEqual(result.hypotheses, state.hypotheses)
+
+    def test_diagnose_records_anomaly_and_stops_probing(self):
+        odd_task = DebugTask(
+            "odd", "def solve(x: int) -> int:\n    return 7\n", Case(1, 3)
+        )
+        with TemporaryDirectory() as tmp:
+            logger = TraceLogger(Path(tmp) / "anomaly.jsonl")
+            actions = Actions(12, logger)
+            tools = ToolExecutor(odd_task.source, odd_task.public, 2.0)
+            state = DiagnosisState(
+                [Hypothesis("adds_two", .5), Hypothesis("double_minus_one", .5)]
+            )
+            failure = FailureTrace(Case(1, 3), Observation("7", "", 0))
+            result = diagnose(
+                failure, Strategy.EIG, RunConfig(), actions, tools, MockProvider(),
+                initial_state=state,
+            )
+            beliefs = {h.name: h.belief for h in result.hypotheses}
+            self.assertEqual(actions.used, 1)  # one anomalous probe, then stop
+            self.assertIn(UNEXPLAINED_CAUSE, beliefs)
+            self.assertAlmostEqual(sum(beliefs.values()), 1, places=12)
+            events = [e["event"] for e in logger.read_events()]
+            self.assertIn("anomaly", events)
+            self.assertEqual(
+                [e.get("unexplained") for e in logger.read_events()
+                 if e["event"] == "update"],
+                [True],
+            )
 
     def test_iterative_repair_recovers_from_invalid_and_wrong_patches(self):
         seen_feedback: list[str] = []

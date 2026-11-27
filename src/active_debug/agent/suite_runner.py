@@ -109,6 +109,19 @@ class SuiteProvider(Protocol):
         seed: int,
     ) -> SuiteDiagnosisPlan: ...
 
+    def revise(
+        self,
+        case: SuiteCase,
+        source: str,
+        state: DiagnosisState,
+        plan: SuiteDiagnosisPlan,
+        probe_codes: dict[int, str],
+        anomaly: Observation,
+        seed: int,
+    ) -> SuiteDiagnosisPlan:
+        """Re-plan after an observation that no current hypothesis predicted."""
+        ...
+
     def choose_probe(
         self,
         case: SuiteCase,
@@ -256,45 +269,9 @@ class OpenAISuiteAdapter:
                 self.last_usage = u2
             return _extract_json_object(raw2)
 
-    def hypothesize(
-        self,
-        case: SuiteCase,
-        source: str,
-        failure: Observation,
-        seed: int,
+    def _plan_from_payload(
+        self, case: SuiteCase, obj: dict[str, Any]
     ) -> SuiteDiagnosisPlan:
-        symbols_str = ", ".join(case.callable_symbols) or "(top-level module)"
-        system_prompt = (
-            "You are an active fault-diagnosis engine for Python debugging. "
-            "Given buggy.py and a failing public pytest test, propose 2 to 4 mutually exclusive, "
-            "falsifiable root-cause hypotheses and 2 to 4 small self-contained Python probe scripts "
-            "that distinguish between those hypotheses.\n"
-            "Rules for probes:\n"
-            "1. Each probe runs as a standalone script with `buggy` importable on PYTHONPATH.\n"
-            "2. Catch expected exceptions inside the probe and print a deterministic single-line "
-            "token (e.g. `print(repr(res))` or `print('ERR:' + type(e).__name__)`) so returncode is 0.\n"
-            "3. Provide the exact single-line stdout string predicted by EACH hypothesis.\n"
-            "Respond ONLY with a JSON object matching this schema:\n"
-            "{\n"
-            '  "hypotheses": [\n'
-            '    {"id": "H1", "function": "Class.method_or_func", "description": "...", "prior": 0.5},\n'
-            '    {"id": "H2", "function": "Class.method_or_func", "description": "...", "prior": 0.5}\n'
-            "  ],\n"
-            '  "probes": [\n'
-            '    {"code": "import buggy\\n...", "cost": 1.0, "predictions": {"H1": "...", "H2": "..."}}\n'
-            "  ]\n"
-            "}"
-        )
-        user_prompt = (
-            f"Case ID: {case.case_id} ({case.topic})\n"
-            f"Callable symbols in buggy.py: {symbols_str}\n\n"
-            f"buggy.py:\n```python\n{source}\n```\n\n"
-            f"Public test (test_public.py):\n```python\n{case.public_test_source}\n```\n\n"
-            f"Initial public test failure:\n{_format_obs(failure)}"
-        )
-        raw = self._call_json_chat(system_prompt, user_prompt, seed)
-        obj = raw
-
         raw_hyps = obj.get("hypotheses")
         if not isinstance(raw_hyps, list) or not raw_hyps:
             raise ProviderResponseError("hypothesize response must contain non-empty 'hypotheses'")
@@ -354,6 +331,84 @@ class OpenAISuiteAdapter:
                 )
 
         return SuiteDiagnosisPlan(hypotheses=hyp_specs, probes=tuple(probe_specs))
+
+    def hypothesize(
+        self,
+        case: SuiteCase,
+        source: str,
+        failure: Observation,
+        seed: int,
+    ) -> SuiteDiagnosisPlan:
+        symbols_str = ", ".join(case.callable_symbols) or "(top-level module)"
+        system_prompt = (
+            "You are an active fault-diagnosis engine for Python debugging. "
+            "Given buggy.py and a failing public pytest test, propose 2 to 4 mutually exclusive, "
+            "falsifiable root-cause hypotheses and 2 to 4 small self-contained Python probe scripts "
+            "that distinguish between those hypotheses.\n"
+            "Rules for probes:\n"
+            "1. Each probe runs as a standalone script with `buggy` importable on PYTHONPATH.\n"
+            "2. Catch expected exceptions inside the probe and print a deterministic single-line "
+            "token (e.g. `print(repr(res))` or `print('ERR:' + type(e).__name__)`) so returncode is 0.\n"
+            "3. Provide the exact single-line stdout string predicted by EACH hypothesis.\n"
+            "Respond ONLY with a JSON object matching this schema:\n"
+            "{\n"
+            '  "hypotheses": [\n'
+            '    {"id": "H1", "function": "Class.method_or_func", "description": "...", "prior": 0.5},\n'
+            '    {"id": "H2", "function": "Class.method_or_func", "description": "...", "prior": 0.5}\n'
+            "  ],\n"
+            '  "probes": [\n'
+            '    {"code": "import buggy\\n...", "cost": 1.0, "predictions": {"H1": "...", "H2": "..."}}\n'
+            "  ]\n"
+            "}"
+        )
+        user_prompt = (
+            f"Case ID: {case.case_id} ({case.topic})\n"
+            f"Callable symbols in buggy.py: {symbols_str}\n\n"
+            f"buggy.py:\n```python\n{source}\n```\n\n"
+            f"Public test (test_public.py):\n```python\n{case.public_test_source}\n```\n\n"
+            f"Initial public test failure:\n{_format_obs(failure)}"
+        )
+        obj = self._call_json_chat(system_prompt, user_prompt, seed)
+        return self._plan_from_payload(case, obj)
+
+    def revise(
+        self,
+        case: SuiteCase,
+        source: str,
+        state: DiagnosisState,
+        plan: SuiteDiagnosisPlan,
+        probe_codes: dict[int, str],
+        anomaly: Observation,
+        seed: int,
+    ) -> SuiteDiagnosisPlan:
+        symbols_str = ", ".join(case.callable_symbols) or "(top-level module)"
+        last_probe = state.history[-1][0] if state.history else None
+        predictions = last_probe.predictions if last_probe is not None else {}
+        system_prompt = (
+            "You are revising an active fault-diagnosis plan after an unpredicted observation. "
+            "Every hypothesis in the previous plan predicted a stdout for the last probe, "
+            "yet the program produced an output that none of them predicted. "
+            "Keep only the previous hypotheses that remain plausible, add at least one new "
+            "falsifiable hypothesis that explains the observed output (for example a distinct "
+            "exception path or edge case), and propose 2 to 4 new small self-contained Python "
+            "probe scripts that discriminate the revised hypotheses. "
+            "Each probe must print one deterministic single-line token and provide the exact "
+            "stdout predicted by EVERY hypothesis id. "
+            "Respond ONLY with the same JSON schema used for the initial plan: "
+            '{"hypotheses": [{"id": ..., "function": ..., "description": ..., "prior": ...}], '
+            '"probes": [{"code": ..., "cost": ..., "predictions": {...}}]}'
+        )
+        user_prompt = (
+            f"Case ID: {case.case_id} ({case.topic})\n"
+            f"Callable symbols in buggy.py: {symbols_str}\n\n"
+            f"buggy.py:\n```python\n{source}\n```\n\n"
+            f"Public test (test_public.py):\n```python\n{case.public_test_source}\n```\n\n"
+            f"{_format_suite_diagnosis_summary(state, plan, probe_codes)}\n\n"
+            f"Predictions for the anomalous probe: {predictions}\n"
+            f"Unpredicted observation (ANOMALY):\n{_format_obs(anomaly)}"
+        )
+        obj = self._call_json_chat(system_prompt, user_prompt, seed)
+        return self._plan_from_payload(case, obj)
 
     def choose_probe(
         self,
@@ -523,6 +578,38 @@ class MockSuiteAdapter:
         )
         return SuiteDiagnosisPlan(hypotheses=hyps, probes=probes)
 
+    def revise(
+        self,
+        case: SuiteCase,
+        source: str,
+        state: DiagnosisState,
+        plan: SuiteDiagnosisPlan,
+        probe_codes: dict[int, str],
+        anomaly: Observation,
+        seed: int,
+    ) -> SuiteDiagnosisPlan:
+        self.last_usage = CallUsage()
+        # Deterministic stand-in: keep the existing causes and add one cause for
+        # the observed anomaly, then probe once more against the revised set.
+        fn = case.callable_symbols[0] if case.callable_symbols else "buggy"
+        observed = anomaly.stdout.strip() or "unexpected"
+        count = len(plan.hypotheses) + 1
+        share = 1.0 / count
+        revised = tuple(
+            HypothesisSpec(h.name, h.description, share, h.target_function)
+            for h in plan.hypotheses
+        ) + (
+            HypothesisSpec(
+                "H_anomaly", f"unmodelled output {observed!r}", share, fn
+            ),
+        )
+        names = [h.name for h in revised]
+        probe = ProbeSpec(
+            code="import buggy\nprint('same')",
+            predictions={name: "same" for name in names},
+        )
+        return SuiteDiagnosisPlan(hypotheses=revised, probes=(probe,))
+
     def choose_probe(
         self,
         case: SuiteCase,
@@ -683,8 +770,12 @@ def run_suite_case(
 
                 used_ids: set[int] = set()
                 while not stopping_policy.should_stop(state, config.confidence):
-                    options = [e for e in candidate_exps if e.argument not in used_ids]
                     required = 2 if strategy == Strategy.LLM else 1
+                    options = experiment_selector.worthwhile(
+                        [e for e in candidate_exps if e.argument not in used_ids],
+                        state,
+                        config.cost_weight,
+                    )
                     if not options or actions.remaining < REPAIR_ACTION_RESERVE + required:
                         break
                     if strategy == Strategy.LLM:
@@ -708,13 +799,63 @@ def run_suite_case(
 
                     used_ids.add(chosen.argument)
                     obs = actions.call("probe", executor.run_experiment, chosen)
+                    unexplained = belief_updater.is_unexplained(chosen, obs)
                     state = belief_updater.update(state, chosen, obs)
                     logger.log(
                         "update",
                         probe=asdict(chosen),
                         probe_code=probe_codes[chosen.argument],
                         observation=asdict(obs),
+                        unexplained=unexplained,
                         beliefs=[asdict(h) for h in state.hypotheses],
+                    )
+
+                    if not unexplained:
+                        continue
+
+                    # The probe produced a token no listed hypothesis predicted.
+                    # Record the anomaly, then re-plan with new hypotheses and
+                    # new probes instead of probing with the refuted plan again.
+                    logger.log(
+                        "anomaly",
+                        probe=asdict(chosen),
+                        probe_code=probe_codes[chosen.argument],
+                        observation=asdict(obs),
+                        beliefs=[asdict(h) for h in state.hypotheses],
+                    )
+                    if actions.remaining < REPAIR_ACTION_RESERVE + required + 1:
+                        break
+                    plan = actions.call(
+                        "replan",
+                        suite_provider.revise,
+                        case,
+                        executor.source,
+                        state,
+                        plan,
+                        probe_codes,
+                        obs,
+                        seed,
+                    )
+                    state = hypothesis_manager.initialize(
+                        [Hypothesis(h.name, h.prior) for h in plan.hypotheses],
+                        history=state.history,
+                    )
+                    candidate_exps = [
+                        executor.register_probe(p.code, p.predictions, p.cost)
+                        for p in plan.probes
+                    ]
+                    probe_codes.update(
+                        {exp.argument: executor.probe_code(exp) for exp in candidate_exps}
+                    )
+                    used_ids = set()
+                    logger.log(
+                        "replan",
+                        state=asdict(state),
+                        hypotheses_detail=[asdict(h) for h in plan.hypotheses],
+                        probes_detail=[
+                            {"probe_id": exp.argument, "code": probe_codes[exp.argument]}
+                            for exp in candidate_exps
+                        ],
                     )
 
                 best_hyp = max(state.hypotheses, key=lambda h: h.belief)

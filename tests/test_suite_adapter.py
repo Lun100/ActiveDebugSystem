@@ -14,13 +14,24 @@ from active_debug.agent.suite_executor import (
     load_bundle,
 )
 from active_debug.agent.suite_runner import (
+    HypothesisSpec,
     MockSuiteAdapter,
+    ProbeSpec,
+    SuiteDiagnosisPlan,
     SuiteRepairProposal,
     normalize_predicted_function,
     run_suite_case,
 )
 from active_debug.agent.trace_logger import TraceLogger
-from active_debug.schemas import Patch, RunConfig, Strategy
+from active_debug.schemas import (
+    Experiment,
+    Observation,
+    Patch,
+    PatchResult,
+    RunConfig,
+    Strategy,
+    TestResult as SchemaTestResult,
+)
 
 EXTERNAL_V3_PATH = Path(__file__).resolve().parents[2] / "evaluation-data" / "bugsinpy-focused-v3"
 
@@ -228,6 +239,143 @@ class SuiteRunnerFourStrategiesTests(unittest.TestCase):
         )
         self.assertEqual(normalize_predicted_function("`helper(x)`", symbols), "helper")
         self.assertIsNone(normalize_predicted_function("", symbols))
+
+
+class FakeSuiteExecutor:
+    """In-memory substitute for SuiteToolExecutor, selected by probe code."""
+
+    outputs: dict[str, Observation] = {}
+
+    def __init__(self, source, suite_dir, timeout, **kwargs):
+        self.initial_source = source
+        self.source = source
+        self.timeout = timeout
+        self._scripts: dict[int, str] = {}
+        self._next = 0
+
+    @property
+    def source_modified(self):
+        return self.source != self.initial_source
+
+    def register_probe(self, code, predictions=None, cost=1.0):
+        probe_id = self._next
+        self._next += 1
+        self._scripts[probe_id] = code
+        return Experiment(probe_id, dict(predictions or {}), cost)
+
+    def probe_code(self, experiment):
+        return self._scripts[experiment.argument]
+
+    def run_public_suite(self):
+        ok = "return a + b" in self.source
+        return Observation("passed" if ok else "failed", "", 0 if ok else 1)
+
+    def run_experiment(self, experiment):
+        return self.outputs.get(
+            self._scripts[experiment.argument], Observation("", "", 0)
+        )
+
+    def apply_patch(self, patch):
+        self.source = patch.source
+        return PatchResult(True)
+
+    def verify_patch(self):
+        ok = "return a + b" in self.source
+        return SchemaTestResult(ok, 1, 1)
+
+
+class _AnomalyAdapter(MockSuiteAdapter):
+    def __init__(self):
+        super().__init__()
+        self.revise_calls = 0
+
+    def hypothesize(self, case, source, failure, seed):
+        return SuiteDiagnosisPlan(
+            hypotheses=(
+                HypothesisSpec("H1", "compute subtracts", 0.5, "Adder.compute"),
+                HypothesisSpec("H2", "add_one uses wrong constant", 0.5, "add_one"),
+            ),
+            probes=(
+                ProbeSpec("probe_anomaly", {"H1": "3", "H2": "7"}),
+            ),
+        )
+
+    def revise(self, case, source, state, plan, probe_codes, anomaly, seed):
+        self.revise_calls += 1
+        assert anomaly.stdout.strip() == "ERR:TypeError"
+        return SuiteDiagnosisPlan(
+            hypotheses=(
+                HypothesisSpec("H1", "compute subtracts", 0.25, "Adder.compute"),
+                HypothesisSpec("H2", "add_one uses wrong constant", 0.25, "add_one"),
+                HypothesisSpec("H3_typeerror", "unmodelled TypeError path", 0.5,
+                               "Adder.compute"),
+            ),
+            probes=(
+                ProbeSpec("probe_revised", {"H1": "3", "H2": "3", "H3_typeerror": "7"}),
+            ),
+        )
+
+
+class _UselessProbeAdapter(MockSuiteAdapter):
+    def hypothesize(self, case, source, failure, seed):
+        hyps = tuple(HypothesisSpec(f"H{i}", f"cause {i}", 0.25) for i in range(1, 5))
+        split = {"H1": "3", "H2": "3", "H3": "7", "H4": "7"}
+        return SuiteDiagnosisPlan(
+            hypotheses=hyps,
+            probes=(
+                ProbeSpec("probe_p0", dict(split)),
+                ProbeSpec("probe_p1", dict(split)),
+                ProbeSpec("probe_p2", {"H1": "3", "H2": "3", "H3": "3", "H4": "3"}),
+            ),
+        )
+
+
+class DiagnosisLoopHardeningTests(unittest.TestCase):
+    def _run(self, tmp, strategy, adapter):
+        bundle = create_mini_bundle(Path(tmp))
+        case = load_bundle(bundle).cases[0]
+        trace = TraceLogger(Path(tmp) / "trace.jsonl")
+        with patch("active_debug.agent.suite_runner.SuiteToolExecutor", FakeSuiteExecutor):
+            outcome = run_suite_case(
+                case, strategy, RunConfig(max_actions=12), adapter, trace,
+                seed=0, sandbox="local",
+            )
+        return outcome, trace.read_events()
+
+    def test_no_informative_probe_stops_before_burning_actions(self):
+        with TemporaryDirectory() as tmp:
+            FakeSuiteExecutor.outputs = {
+                "probe_p0": Observation("3", "", 0),
+                "probe_p1": Observation("3", "", 0),
+                "probe_p2": Observation("3", "", 0),
+            }
+            outcome, events = self._run(tmp, Strategy.EIG, _UselessProbeAdapter())
+        self.assertEqual(outcome.stop_reason, "public_pass")
+        probes = [
+            e for e in events if e["event"] == "action" and e["name"] == "probe"
+        ]
+        self.assertEqual(len(probes), 1)
+        self.assertNotIn("replan", [e["event"] for e in events])
+
+    def test_unpredicted_observation_replans_hypotheses_and_probes(self):
+        with TemporaryDirectory() as tmp:
+            FakeSuiteExecutor.outputs = {
+                "probe_anomaly": Observation("ERR:TypeError", "", 0),
+                "probe_revised": Observation("3", "", 0),
+            }
+            adapter = _AnomalyAdapter()
+            outcome, events = self._run(tmp, Strategy.EIG, adapter)
+        self.assertEqual(outcome.stop_reason, "public_pass", outcome.error_detail)
+        self.assertEqual(adapter.revise_calls, 1)
+        names = [e["event"] for e in events]
+        self.assertIn("anomaly", names)
+        self.assertIn("replan", names)
+        prior = next(e for e in events if e["event"] == "prior")
+        replan = next(e for e in events if e["event"] == "replan")
+        self.assertEqual(len(replan["state"]["hypotheses"]), 3)
+        self.assertNotEqual(
+            prior["state"]["hypotheses"], replan["state"]["hypotheses"]
+        )
 
 
 class BatchDeliverablesAndCliTests(unittest.TestCase):

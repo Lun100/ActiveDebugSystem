@@ -10,6 +10,6 @@
 
 ## 结果与分析
 
-每轮运行写独立 UUID 文件。start 保存策略、任务、配置与 Provider，action/response 通过 index 对齐，prior/update 保存结构化诊断证据，finish 保存最终 verdict 对应的 validation、actions、seconds、stop_reason。error 表示异常中断。用 summarize 汇总同策略的完整 RunResult；正式实验须按运行清单补记缺失或异常，禁止仅以正常退出子集作为成功率分母。
+每轮运行写独立 UUID 文件。start 保存策略、任务、配置与 Provider，action/response 通过 index 对齐，prior/update 保存结构化诊断证据（update 标记 unexplained），anomaly 记录超出所有预测的观察，replan 保存重新生成后的假设与探针，finish 保存最终 verdict 对应的 validation、actions、seconds、stop_reason。error 表示异常中断。用 summarize 汇总同策略的完整 RunResult；正式实验须按运行清单补记缺失或异常，禁止仅以正常退出子集作为成功率分母。
 
 修复成功以所有验证用例通过为准。定位准确率需先定义文件或函数粒度、预测提交时刻和允许的真因集合。拟报告每题配对的成功差、成本分布与区间；对超时和预算耗尽预注册计分规则。消融时固定候选、先验及预算，只改变选择器或成本权重，记录选择轨迹。真实模型输出、数据集版本、预算和随机种子冻结后再开始正式实验。

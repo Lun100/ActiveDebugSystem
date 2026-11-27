@@ -1,9 +1,19 @@
 import unittest
 from math import log2
 
-from active_debug.diagnosis.belief_updater import update
+from active_debug.diagnosis.belief_updater import (
+    ANOMALY_SHARE,
+    UNEXPLAINED_CAUSE,
+    is_unexplained,
+    update,
+)
 from active_debug.diagnosis.experiment_generator import generate as generate_experiments
-from active_debug.diagnosis.experiment_selector import information_gain, select
+from active_debug.diagnosis.experiment_selector import (
+    expected_utility,
+    information_gain,
+    select,
+    worthwhile,
+)
 from active_debug.diagnosis.hypothesis_generator import generate as generate_hypotheses
 from active_debug.diagnosis.hypothesis_manager import initialize
 from active_debug.diagnosis.stopping_policy import should_stop
@@ -59,6 +69,30 @@ class InformationGainTests(unittest.TestCase):
         costly = Experiment(1, {"a": "1", "b": "2"}, 20)
         self.assertIs(select([silent, costly], state, weight), silent)
 
+    def test_open_world_mass_keeps_a_probe_informative(self):
+        # With only listed causes at 0.8 total, identical predictions have 0 bit.
+        # The unpredicted residual is a separate outcome, so the probe can test
+        # whether the listed causes are still adequate.
+        state = state_of(("a", .4), ("b", .4), (UNEXPLAINED_CAUSE, .2))
+        probe = Experiment(0, {"a": "2", "b": "2"})
+        self.assertAlmostEqual(information_gain(probe, state), 0.7219280948873623, places=12)
+
+    def test_worthwhile_drops_zero_gain_probes(self):
+        state = state_of(("a", .5), ("b", .5))
+        silent = Experiment(0, {"a": "2", "b": "2"})
+        self.assertEqual(worthwhile([silent], state, .1), [])
+
+    def test_worthwhile_drops_probes_whose_cost_outweighs_their_gain(self):
+        state = state_of(("a", .5), ("b", .5))
+        costly = Experiment(1, {"a": "1", "b": "2"}, 20)
+        self.assertLess(expected_utility(costly, state, .1), 0)
+        self.assertEqual(worthwhile([costly], state, .1), [])
+
+    def test_worthwhile_keeps_positive_utility_probes(self):
+        state = state_of(("a", .5), ("b", .5))
+        split = Experiment(1, {"a": "1", "b": "2"})
+        self.assertEqual(worthwhile([split], state, .1), [split])
+
     def test_select_rejects_empty_options(self):
         state = state_of(("a", .5), ("b", .5))
         with self.assertRaisesRegex(ValueError, "candidate"):
@@ -89,13 +123,45 @@ class BeliefUpdateTests(unittest.TestCase):
         self.assertEqual(beliefs[2], 0)
         self.assertAlmostEqual(sum(beliefs), 1, places=12)
 
-    def test_unexplained_observation_preserves_prior_and_is_recorded(self):
+    def test_unexplained_observation_opens_world_and_is_recorded(self):
         state = state_of(("a", .8), ("b", .2))
         probe = Experiment(0, {"a": "1", "b": "2"})
         new = update(state, probe, Observation("other", "", 0))
-        self.assertEqual(new.hypotheses, state.hypotheses)
+        beliefs = {h.name: h.belief for h in new.hypotheses}
+        self.assertAlmostEqual(beliefs[UNEXPLAINED_CAUSE], ANOMALY_SHARE, places=12)
+        self.assertAlmostEqual(beliefs["a"], .8 * (1 - ANOMALY_SHARE), places=12)
+        self.assertAlmostEqual(beliefs["b"], .2 * (1 - ANOMALY_SHARE), places=12)
+        self.assertNotEqual(new.hypotheses, state.hypotheses)
+        self.assertAlmostEqual(sum(beliefs.values()), 1, places=12)
         self.assertEqual(new.history, [(probe, Observation("other", "", 0))])
         self.assertEqual(state.history, [])
+
+    def test_repeated_unexplained_observations_grow_open_world_mass(self):
+        state = state_of(("a", .8), ("b", .2))
+        probe = Experiment(0, {"a": "1", "b": "2"})
+        state = update(state, probe, Observation("other", "", 0))
+        state = update(state, probe, Observation("still other", "", 0))
+        beliefs = {h.name: h.belief for h in state.hypotheses}
+        second = ANOMALY_SHARE + (1 - ANOMALY_SHARE) * ANOMALY_SHARE
+        self.assertAlmostEqual(beliefs[UNEXPLAINED_CAUSE], second, places=12)
+        self.assertAlmostEqual(sum(beliefs.values()), 1, places=12)
+
+    def test_explained_observation_retires_open_world_mass(self):
+        state = state_of(("a", .8), ("b", .2))
+        anomaly = Experiment(0, {"a": "1", "b": "2"})
+        state = update(state, anomaly, Observation("other", "", 0))
+        probe = Experiment(1, {"a": "3", "b": "4"})
+        new = update(state, probe, Observation("3", "", 0))
+        beliefs = {h.name: h.belief for h in new.hypotheses}
+        self.assertNotIn(UNEXPLAINED_CAUSE, beliefs)
+        self.assertEqual(beliefs, {"a": 1, "b": 0})
+
+    def test_is_unexplained_only_judges_conclusive_unpredicted_runs(self):
+        probe = Experiment(0, {"a": "1", "b": "2"})
+        self.assertTrue(is_unexplained(probe, Observation("other", "", 0)))
+        self.assertFalse(is_unexplained(probe, Observation("1", "", 0)))
+        self.assertFalse(is_unexplained(probe, Observation("other", "", -1)))
+        self.assertFalse(is_unexplained(probe, Observation("other", "", 0, True)))
 
     def test_error_and_timeout_preserve_prior(self):
         state = state_of(("a", .8), ("b", .2))
@@ -122,11 +188,13 @@ class BeliefUpdateTests(unittest.TestCase):
         new = update(state, probe, Observation("  \n", "", 0))
         self.assertEqual([h.belief for h in new.hypotheses], [1, 0])
 
-    def test_blank_stdout_without_match_preserves_prior(self):
+    def test_blank_stdout_without_match_is_an_anomaly(self):
         state = state_of(("a", .5), ("b", .5))
         probe = Experiment(0, {"a": "1", "b": "2"})
         new = update(state, probe, Observation("", "", 0))
-        self.assertEqual(new.hypotheses, state.hypotheses)
+        beliefs = {h.name: h.belief for h in new.hypotheses}
+        self.assertAlmostEqual(beliefs[UNEXPLAINED_CAUSE], ANOMALY_SHARE, places=12)
+        self.assertAlmostEqual(sum(beliefs.values()), 1, places=12)
 
 
 class ExperimentGeneratorTests(unittest.TestCase):
