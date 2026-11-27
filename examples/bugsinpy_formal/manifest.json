@@ -1,0 +1,40 @@
+{
+  "name": "bugsinpy-formal-v1",
+  "dataset_revision": "11c5f1eea954a42132cfd06bf257766a7963e0fd",
+  "evaluation_python": "3.8.1",
+  "image": "active-debug-pysnooper-1",
+  "cases": [
+    {
+      "id": "tqdm/1",
+      "topic": "枚举起始编号"
+    },
+    {
+      "id": "tqdm/3",
+      "topic": "进度对象的真假判断"
+    },
+    {
+      "id": "tqdm/8",
+      "topic": "自定义进度条格式"
+    },
+    {
+      "id": "youtube-dl/3",
+      "topic": "文本实体解码"
+    },
+    {
+      "id": "youtube-dl/6",
+      "topic": "字幕缺省时间处理"
+    },
+    {
+      "id": "youtube-dl/17",
+      "topic": "可选布尔命令行参数"
+    },
+    {
+      "id": "tornado/5",
+      "topic": "时钟回拨时的周期调度"
+    },
+    {
+      "id": "tornado/9",
+      "topic": "缺省查询参数处理"
+    }
+  ]
+}
