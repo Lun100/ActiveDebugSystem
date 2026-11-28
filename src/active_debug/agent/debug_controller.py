@@ -68,7 +68,9 @@ def diagnose(
             probe = queued_probe
             queued_probe = None
         else:
-            options = experiment_generator.generate(state)
+            options = experiment_selector.worthwhile(
+                experiment_generator.generate(state), state, config.cost_weight
+            )
             required = 2 if strategy == Strategy.LLM else 1
             if not options or actions.remaining < REPAIR_ACTION_RESERVE + required:
                 break
@@ -81,13 +83,27 @@ def diagnose(
                 probe = experiment_selector.select(options, state, config.cost_weight)
 
         obs = actions.call("probe", tools.run_experiment, probe)
+        unexplained = belief_updater.is_unexplained(probe, obs)
         state = belief_updater.update(state, probe, obs)
         actions.logger.log(
             "update",
             probe=asdict(probe),
             observation=asdict(obs),
+            unexplained=unexplained,
             beliefs=[asdict(h) for h in state.hypotheses],
         )
+        if unexplained:
+            # Without a provider-side re-plan hook here, stop probing: running
+            # more probes against an unchanged hypothesis set cannot help.
+            actions.logger.log(
+                "anomaly",
+                probe=asdict(probe),
+                observation=asdict(obs),
+                beliefs=[asdict(h) for h in state.hypotheses],
+            )
+            if on_checkpoint is not None:
+                on_checkpoint(state, None)
+            break
         if on_checkpoint is not None:
             on_checkpoint(state, None)
     return state

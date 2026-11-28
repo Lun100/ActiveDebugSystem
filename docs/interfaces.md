@@ -6,7 +6,8 @@
 | A → B | FailureTrace(case, actual) → list[Hypothesis] | 名称唯一，非负信念之和为 1 |
 | B → A | Experiment(argument, predictions, cost) | 探针输入为整数；确定性选择器要求每个候选假设都有输出预测 |
 | A → B | run_experiment(experiment) → Observation | stdout、stderr 为文本；超时置 timed_out，返回码为 -1 |
-| B → A | update(state, probe, obs) → DiagnosisState | 追加历史，返回新状态；未解释或执行异常时保留先验 |
+| B → A | update(state, probe, obs) → DiagnosisState | 追加历史；执行异常或超时保留先验；成功输出无任何假设能解释时记为异常，新增或增大 `unexpected_output` 开放世界假设，A 随即重新生成假设与探针 |
+| B → A | worthwhile(options, state, weight) → list[Experiment] | 只返回期望信息增益减去成本惩罚后为正的探针；为空表示诊断应停止 |
 | Provider → A | repair(task, failure, state, feedback) → Patch | 单文件完整替换文本；state 在两个 baseline 中为 None |
 | A → C | apply_patch(patch) → PatchResult；verify_patch() → TestResult | 前者编译成功才替换当前候选，后者仅检验公开输入 |
 | C → 汇总 | validate(source, cases, timeout) → TestResult；benchmark → RunResult | checked 是实际执行数，passed 要求所有用例通过 |
